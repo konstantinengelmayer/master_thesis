@@ -22,23 +22,75 @@ library(tibble)     # For rownames_to_column
 
 # Load custom functions (e.g., extract_TRW)
 source("scripts/r/functions/extract_TRW.R")
+source("scripts/r/functions/extract_SDC_buffered.R") # Landsat reflectance
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. SATELLITE DATA  – daily VIs per plot
+# ─────────────────────────────────────────────────────────────────────────────
+## 1A  raw reflectance pixels --------------------------------------------------
+SDC_df <- extract_SDC_buffered(
+  folder_paths = c("data/satellite_data/SDC/lindenberg_eifel_koenigsforst",
+                   "data/satellite_data/SDC/kellerwald_lahntal"),
+  points_path  = "data/vector_data/trees_all_plots.gpkg",
+  buffer_m     = 1,
+  method = "sgolay"
+)
+names(SDC_df)[1] <- "plot"                          # first col → plot ID
+
+## 1B  add calendar fields -----------------------------------------------------
+SDC_df <- SDC_df |>
+  mutate(year = year(date),           # calendar year
+         doy  = yday(date))           # day-of-year (1–365/366)
+
+## 1C  daily mean vegetation indices ------------------------------------------
+# if multiple Landsat observations fall on the same day, we average them
+SDC_daily <- SDC_df |>
+  group_by(plot, date) |>
+  summarise(
+    NDVI   = mean((nir-red)/(nir+red), na.rm = TRUE),
+    EVI    = mean(2.5*(nir-red)/(nir+6*red-7.5*blue+1), na.rm = TRUE),
+    NDMI   = mean((nir-swir1)/(nir+swir1), na.rm = TRUE),
+    NDWI   = mean((green+nir)/(green-nir) * nir, na.rm = TRUE),
+    NBR    = mean((nir-swir2)/(nir+swir2), na.rm = TRUE),
+    NBR2   = mean((swir1-swir2)/(swir1+swir2), na.rm = TRUE),
+    OSAVI  = mean((nir-red)/(nir+red+0.16), na.rm = TRUE),
+    NIRv   = mean(((nir-red)/(nir+red))*nir, na.rm = TRUE),
+    NIRv   = mean(((nir-red)/(nir+red))*nir + 0.08, na.rm = TRUE),
+    VMI    = mean((nir-swir1)*(nir-swir2)/(nir+swir1+swir2), na.rm = TRUE),
+    NMDI   = mean((nir-(swir1-swir2))/(nir+(swir1-swir2)), na.rm = TRUE),
+    MSI    = mean(nir/swir1, na.rm = TRUE),
+    MSII   = mean(nir/swir2, na.rm = TRUE),
+    MSAVI2 = mean((nir*swir1-swir2*red)/(nir*swir1+swir2*red+1e-3), na.rm = TRUE),
+    VMSI   = mean((nir+swir1-swir2-red)/(nir+swir1+swir2+red+1e-3), na.rm = TRUE),
+    EVDI   = mean((nir-red-swir2)/(nir+red+swir2), na.rm = TRUE),
+    TBMI   = mean((swir1-swir2-red)/(swir1+swir2+red), na.rm = TRUE),
+    year   = first(year),                       # keep calendar fields
+    doy    = first(doy),
+    .groups = "drop"
+  )
+
+SDC_yearly <- SDC_daily %>%
+  dplyr::filter(doy >= 90 & doy <= 300) %>%
+  group_by(plot, year) %>%
+  summarise(across(NDVI:TBMI, sum, na.rm = TRUE), .groups = "drop")
+
 
 
 #### 2) LOAD & PREPARE TREE RING WIDTH (TRW) DATA ####
-# Define paths
-points_path <- "data/vector_data/Measured_Tree_coordinates.gpkg"
-xls_folder  <- "data/dendro_data/MW3_Daten/Dendro-Data/d-XLS"
+TRW_df <- extract_TRW(
+  xls_folder  = "data/dendro_data/MW3_Daten/Dendro-Data/d-XLS",
+  points_path = "data/vector_data/trees_all_plots.gpkg"
+)
 
-# Extract TRW data using custom function
-TRW_df <- extract_TRW(xls_folder, points_path, crop = FALSE)
 
 # Reshape data from long to wide format:
 # - Each column is one tree’s ring-width measurements.
 # - 'Year' remains as a variable (later used as rownames).
 TRW_df_wide <- TRW_df %>%
-  select(Year, treeid, ring_width) %>%
+  select(Year, tree_id, ring_width) %>%
   pivot_wider(id_cols = Year,
-              names_from = treeid,
+              names_from = tree_id,
               values_from = ring_width) %>%
   arrange(Year)
 
@@ -72,180 +124,137 @@ for (m in methods_available) {
 }
 
 plot.rwl(as.rwl(rwi_list$Spline), plot.type = "spag")
-#### 4) CORRELATION ANALYSIS: RWI vs. VEGETATION INDICES ####
-# (Assumes SDC_yearly exists and contains vegetation indices such as NDVI, EVI, etc.)
+###############################################################################
+## Hyper-parameter grid-search for dplR::detrend()                           ##
+## - compares many detrending settings, computes RWI–vegetation correlations ##
+###############################################################################
+library(furrr)        # future + purrr syntax
 
-# Initialize list to store correlation results per method
-method_cor_results <- list()
+## use all logical cores; adapt to your cluster if needed
+future::plan(multisession)    # on Windows/macOS
+# future::plan(multicore)     # on Linux
 
-# Loop over each detrending method to compute correlations
-for (m in methods_available) {
-  cat("Computing correlations for method:", m, "\n")
+###############################################################################
+## 1.  Build the parameter grid   (exactly as you already defined)           ##
+###############################################################################
+spline_grid <- crossing(
+  method = "Spline",
+  nyrs   = seq(1,60,1),
+  f      = seq(0.5, 0.9, 0.05)
+)
+
+
+
+grid <- bind_rows(spline_grid) %>%
+  mutate(method_id = sprintf("%s_%03d", method, row_number()))
+
+###############################################################################
+## 2.  A function that does *everything* for ONE grid row                    ##
+###############################################################################
+evaluate_detrend <- function(params_row,
+                             trw  = TRW_df,
+                             vix  = SDC_yearly) {
   
-  # a) Detrend data and convert to long format (IDs as 'point_id')
-  rwi_long <- rwi_list[[m]] %>%
-    tibble::rownames_to_column("year") %>%
-    pivot_longer(cols = -year,
-                 names_to = "point_id",
-                 values_to = "RWI") %>%
-    mutate(year = as.numeric(year),
-           point_id = as.integer(point_id))
+  ## ---- 2·A  collect arguments for detrend() -------------------------------
+  detr_args <- list(
+    method = params_row$method,
+    nyrs   = params_row$nyrs,
+    f      = params_row$f
+  ) |>
+    purrr::discard(is.na)
   
-  # b) Merge RWI with vegetation indices (SDC_yearly) and drop NA rows
-  df_merged <- SDC_yearly %>%
-    left_join(rwi_long, by = c("point_id", "year")) %>%
-    na.omit()
+  ## ---- 2·B  build per-plot chronologies -----------------------------------
+  chronologies_by_plot <- trw %>%
+    group_by(plot) %>%
+    group_modify(~{
+      wide <- pivot_wider(.x,
+                          id_cols     = Year,
+                          names_from  = tree_id,
+                          values_from = ring_width) %>%
+        tibble::column_to_rownames("Year")
+      
+      rwi  <- do.call(detrend, c(list(as.rwl(wide)), detr_args))
+      
+      chron <- chron(as.data.frame(rwi),
+                     prefix = paste0("CH_", unique(.x$plot)))
+      
+      chron |>
+        tibble::rownames_to_column("year") |>
+        mutate(year = as.numeric(year),
+               plot = unique(.x$plot))
+    }) |>
+    ungroup() |>
+    rename(TRI = starts_with("std"))
   
-  # c) Compute per-tree correlations between RWI and each vegetation index
-  df_cor <- df_merged %>%
-    group_by(point_id) %>%
-    summarize(
-      cor_NDVI  = cor(NDVI,  RWI, use = "complete.obs"),
-      cor_EVI   = cor(EVI,   RWI, use = "complete.obs"),
-      cor_GNDVI = cor(GNDVI, RWI, use = "complete.obs"),
-      cor_NDMI  = cor(NDMI,  RWI, use = "complete.obs"),
-      cor_NDWI  = cor(NDWI,  RWI, use = "complete.obs"),
-      cor_MNDWI = cor(MNDWI, RWI, use = "complete.obs"),
-      cor_NBR   = cor(NBR,   RWI, use = "complete.obs"),
-      cor_NBR2  = cor(NBR2,  RWI, use = "complete.obs"),
-      cor_ARVI  = cor(ARVI,  RWI, use = "complete.obs"),
-      cor_OSAVI = cor(OSAVI, RWI, use = "complete.obs"),
-      cor_NIRv  = cor(NIRv,  RWI, use = "complete.obs")
-    ) %>%
-    ungroup()
+  ## ---- 2·C  merge with veg-indices & get correlations ----------------------
+  df_cor <- vix |>
+    left_join(chronologies_by_plot, by = c("plot", "year")) |>
+    na.omit() |>
+    group_by(plot) |>
+    summarize(across(
+      c(NDVI, EVI, NDMI, NDWI, NBR, NBR2, OSAVI, NIRv, VMI,
+        NMDI, MSI, MSII, MSAVI2, VMSI, EVDI, TBMI),
+      \(x) cor(x, TRI, use = "complete.obs"),
+      .names = "cor_{.col}"
+    ), .groups = "drop")
   
-  # d) Store the results
-  method_cor_results[[m]] <- df_cor
+  ## ---- 2·D  collapse to a single row with mean over all indices -----------
+  out <- df_cor |>
+    summarize(across(starts_with("cor_"), mean, na.rm = TRUE)) |>
+    mutate(mean_cor_all = rowMeans(across(starts_with("cor_")), na.rm = TRUE))
+  
+  ## attach parameter info so we know what produced the result
+  bind_cols(params_row, out)
 }
 
-# Summarize mean correlations by method using purrr::map_df
-df_method_summary <- map_df(method_cor_results, function(df_cor) {
-  df_cor %>%
-    summarize(
-      mean_cor_NDVI  = mean(cor_NDVI,  na.rm = TRUE),
-      mean_cor_EVI   = mean(cor_EVI,   na.rm = TRUE),
-      mean_cor_GNDVI = mean(cor_GNDVI, na.rm = TRUE),
-      mean_cor_NDMI  = mean(cor_NDMI,  na.rm = TRUE),
-      mean_cor_NDWI  = mean(cor_NDWI,  na.rm = TRUE),
-      mean_cor_MNDWI = mean(cor_MNDWI, na.rm = TRUE),
-      mean_cor_NBR   = mean(cor_NBR,   na.rm = TRUE),
-      mean_cor_NBR2  = mean(cor_NBR2,  na.rm = TRUE),
-      mean_cor_ARVI  = mean(cor_ARVI,  na.rm = TRUE),
-      mean_cor_OSAVI = mean(cor_OSAVI, na.rm = TRUE),
-      mean_cor_NIRv  = mean(cor_NIRv,  na.rm = TRUE)
-    )
-}, .id = "method")
+###############################################################################
+## 3.  Run the function in parallel for every grid row                       ##
+###############################################################################
+## split the grid into a list of single-row data frames so the function
+## receives one row at a time:
+grid_list <- split(grid, seq_len(nrow(grid)))
 
-# View summary correlations by detrending method
+df_method_summary <- future_map_dfr(
+  grid_list,
+  evaluate_detrend,
+  .options = furrr_options(seed = TRUE),   # reproducible correlations
+  .progress = TRUE                         # nice progress bar
+) |>
+  arrange(desc(mean_cor_all))
+
 print(df_method_summary)
 
-
-#### 5) PLOTTING: RWI (Friedman & Spline) vs. VEGETATION INDICES ####
-# Detrend with Friedman and Spline and convert to long format
-
-# Function to detrend and pivot to long format
-get_rwi_long <- function(rwl, method, value_name) {
-  detrend(rwl, method = method) %>%
-    tibble::rownames_to_column("year") %>%
-    pivot_longer(-year, names_to = "point_id", values_to = value_name) %>%
-    mutate(year = as.numeric(year),
-           point_id = as.integer(point_id))
-}
-
-rwi_friedman <- get_rwi_long(TRW_rwl, method = "Friedman", value_name = "RWI_Friedman")
-rwi_spline   <- get_rwi_long(TRW_rwl, method = "Spline",   value_name = "RWI_Spline")
-
-
-
-
-# Merge detrended data with SDC_yearly (vegetation indices)
-df_rwi_compare <- rwi_friedman %>%
-  left_join(rwi_spline, by = c("year", "point_id")) %>%
-  left_join(SDC_yearly, by = c("year", "point_id")) %>%
-  na.omit()
-
-# Define vegetation indices to compare
-vegetation_indices <- c("NDVI", "EVI", "GNDVI", "NDMI", 
-                        "NDWI", "MNDWI", "NBR", "NBR2", 
-                        "ARVI", "OSAVI", "NIRv")
-
-# For each vegetation index, standardize (z-score) and plot comparisons
-for (idx in vegetation_indices) {
-  
-  # A) Standardize by tree/point (z-score per point_id)
-  df_normalized <- df_rwi_compare %>%
-    group_by(point_id) %>%
-    mutate(
-      idx_value   = .data[[idx]],
-      z_index     = (idx_value - mean(idx_value, na.rm = TRUE)) / sd(idx_value, na.rm = TRUE),
-      z_fried     = (RWI_Friedman - mean(RWI_Friedman, na.rm = TRUE)) / sd(RWI_Friedman, na.rm = TRUE),
-      z_spline    = (RWI_Spline - mean(RWI_Spline, na.rm = TRUE)) / sd(RWI_Spline, na.rm = TRUE)
-    ) %>%
-    ungroup()
-  
-  # B) Pivot longer for plotting (one line per variable)
-  df_longplot <- df_normalized %>%
-    select(year, point_id, z_index, z_fried, z_spline) %>%
-    pivot_longer(cols = c(z_index, z_fried, z_spline),
-                 names_to = "variable",
-                 values_to = "z_value")
-  
-  # C) Plot the z-scores (one panel per point)
-  p <- ggplot(df_longplot, aes(x = year, y = z_value, color = variable)) +
-    geom_line() +
-    facet_wrap(~ point_id) +
-    scale_color_manual(
-      name = NULL,
-      values = c("z_index"  = "red",
-                 "z_fried"  = "blue",
-                 "z_spline" = "green"),
-      labels = c("z_index"  = idx,
-                 "z_fried"  = "RWI (Friedman)",
-                 "z_spline" = "RWI (Spline)")
-    ) +
-    labs(
-      title = paste("Z-Score Comparison:", idx, "vs. RWI (Friedman & Spline)"),
-      x = "Year",
-      y = "Normalized Value (Z-score)"
-    )
-  
-  print(p)
-  # Optionally, save the plot:
-  # ggsave(filename = paste0("zscore_comparison_", idx, ".png"), plot = p, width = 10, height = 6)
-}
-
-
-#### 6) PLOTTING: RAW TRW vs. DETRENDED RWI (Spline & Friedman) ####
 # Detrend again with Spline and Friedman; this time we assume the raw TRW is in long format.
 # Ensure raw TRW data uses consistent naming (Year -> year, treeid remains)
 
 # Detrend (and pivot) using Spline
 rwi_spline_long <- detrend(TRW_rwl, method = "Spline") %>%
   tibble::rownames_to_column("year") %>%
-  pivot_longer(-year, names_to = "treeid", values_to = "RWI_Spline") %>%
+  pivot_longer(-year, names_to = "tree_id", values_to = "RWI_Spline") %>%
   mutate(year = as.numeric(year),
-         treeid = as.numeric(treeid))
+         tree_id = as.numeric(tree_id))
 
 # Detrend (and pivot) using Friedman
 rwi_fried_long <- detrend(TRW_rwl, method = "Friedman") %>%
   tibble::rownames_to_column("year") %>%
-  pivot_longer(-year, names_to = "treeid", values_to = "RWI_Friedman") %>%
+  pivot_longer(-year, names_to = "tree_id", values_to = "RWI_Friedman") %>%
   mutate(year = as.numeric(year),
-         treeid = as.numeric(treeid))
+         tree_id = as.numeric(tree_id))
 
 # Convert raw TRW data to long format (rename Year to year)
 TRW_long <- TRW_df %>%
-  rename(year = Year)
+  rename(year = Year) %>%
+  mutate(tree_id = as.numeric(tree_id))
 
-# Merge raw TRW with detrended RWI data
+# Merge raw TRW with detrendedtree_id# Merge raw TRW with detrended RWI data
 df_compare <- TRW_long %>%
-  left_join(rwi_spline_long, by = c("year", "treeid")) %>%
-  left_join(rwi_fried_long, by = c("year", "treeid")) %>%
+  left_join(rwi_spline_long, by = c("year", "tree_id")) %>%
+  left_join(rwi_fried_long, by = c("year", "tree_id")) %>%
   na.omit()
 
 # Compute z-scores for raw TRW and detrended RWI values (by treeid)
 df_zscore <- df_compare %>%
-  group_by(treeid) %>%
+  group_by(tree_id) %>%
   mutate(
     z_raw    = (ring_width - mean(ring_width, na.rm = TRUE)) / sd(ring_width, na.rm = TRUE),
     z_spline = (RWI_Spline - mean(RWI_Spline, na.rm = TRUE)) / sd(RWI_Spline, na.rm = TRUE),
@@ -255,31 +264,41 @@ df_zscore <- df_compare %>%
 
 # Reshape to long format for plotting
 df_longplot <- df_zscore %>%
-  select(year, treeid, z_raw, z_spline, z_fried) %>%
+  select(year, tree_id, z_raw, z_spline, z_fried) %>%
   pivot_longer(cols = c(z_raw, z_spline, z_fried),
                names_to = "variable",
                values_to = "z_value") %>%
-  filter(year >= 2000 & year <= 2022)
+  dplyr::filter(year >= 1900 & year <= 2022)
 
-# Plot raw TRW and detrended RWI (Spline & Friedman) on the same chart
-p <- ggplot(df_longplot, aes(x = year, y = z_value, color = variable)) +
-  geom_line() +
-  facet_wrap(~ treeid) +
-  scale_color_manual(
-    name = NULL,
-    values = c("z_raw"    = "black",
-               "z_spline" = "blue",
-               "z_fried"  = "red"),
-    labels = c("z_raw"    = "Raw TRW",
-               "z_spline" = "Spline RWI",
-               "z_fried"  = "Friedman RWI")
-  ) +
-  labs(
-    title = "Z-Score Comparison: Non-detrended TRW vs. Spline & Friedman RWI",
-    x = "Year",
-    y = "Z-score (per tree)"
-  )
 
-print(p)
-# Optionally, save the plot:
-# ggsave("detrended_vs_raw.png", p, width = 10, height = 6)
+
+# Get unique tree IDs
+tree_ids <- unique(df_longplot$tree_id)
+
+# Loop over each tree_id
+for (tree in tree_ids) {
+  
+  # Filter for current tree
+  df_tree <- df_longplot %>% dplyr::filter(tree_id == tree)
+  
+  # Create the plot
+  p <- ggplot(df_tree, aes(x = year, y = z_value, color = variable)) +
+    geom_line() +
+    scale_color_manual(
+      name = NULL,
+      values = c("z_raw" = "black", "z_spline" = "blue", "z_fried" = "red"),
+      labels = c("z_raw" = "Raw TRW", "z_spline" = "Spline RWI", "z_fried" = "Friedman RWI")
+    ) +
+    labs(
+      title = paste("Z-Score Comparison for Tree ID:", tree),
+      x = "Year",
+      y = "Z-score"
+    ) +
+    theme_minimal()
+  
+  # Print or save the plot
+  print(p)
+  
+  # Optional: Save to file, e.g., PNG
+  # ggsave(paste0("Tree_", tree, "_Comparison.png"), plot = p, width = 8, height = 5)
+}

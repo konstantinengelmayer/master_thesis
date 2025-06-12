@@ -6,6 +6,7 @@ library(dplyr)
 library(lubridate)
 library(zoo)       # for rollapply
 library(signal)    # for Savitzky-Golay filter (install if needed)
+library(tidyr)
 
 source("scripts/r/functions/extract_SDC.R")
 
@@ -134,3 +135,67 @@ for (point in point_ids) {
   )
 }
 
+source("scripts/r/functions/extract_SDC_buffered.R")
+SDC_df <- extract_SDC_buffered(
+  folder_paths = c("data/satellite_data/SDC/lindenberg_eifel_koenigsforst",
+                   "data/satellite_data/SDC/kellerwald_lahntal"),
+  points_path  = "data/vector_data/trees_all_plots.gpkg",
+  buffer_m     = 1,
+  method = "original",
+)
+names(SDC_df)[1] <- "plot"   
+
+SDC_df <- SDC_df %>%
+  mutate(
+    year   = year(date),
+    period = ifelse(year <= 2012, "2000-2012", "2013+")
+  )
+
+
+plot_ids <- unique(SDC_df$plot)
+
+
+# ── user inputs ────────────────────────────────────────────────────────────────
+bands <- c("blue", "green", "red", "nir", "swir1", "swir2")
+outdir  <- "figures/timeseries"              # where to write the PNGs
+# nice, high-contrast colours for the two periods
+period_cols <- c("2000-2012" = "#1f78b4",   # blue
+                 "2013+"     = "#e31a1c")   # red
+library(patchwork) 
+# ── iterate over every site (plot) ─────────────────────────────────────────────
+for (pid in unique(SDC_df$plot)) {
+  
+  # 1. tidy data for this site --------------------------------------------------
+  df_site <- SDC_df %>%
+    dplyr::filter(plot == pid) %>%
+    mutate(period = factor(period, levels = names(period_cols))) %>%
+    select(date, period, all_of(bands)) %>%
+    pivot_longer(cols   = all_of(bands),
+                 names_to  = "band",
+                 values_to = "value")
+  
+  # 2. build six individual plots (one per band) -------------------------------
+  plot_list <- lapply(bands, function(b) {
+    ggplot(df_site %>% dplyr::filter(band == b),
+           aes(x = date, y = value,
+               colour = period, group = period)) +
+      geom_line() +
+      scale_colour_manual(values = period_cols) +
+      labs(title = b, x = NULL, y = "Reflectance (DN)") +
+      theme_minimal(base_size = 10) +
+      theme(legend.position = "none")          # suppress legends inside panels
+  })
+  
+  
+  # 3. arrange them in a 3 × 2 grid with patchwork -----------------------------
+  grid   <- wrap_plots(plotlist = plot_list, ncol = 2) +
+    plot_annotation(
+      title = paste("Original time series – site", pid),
+      theme = theme(plot.title = element_text(size = 14, face = "bold"))
+    )
+  
+  # 4. save to disk -------------------------------------------------------------
+  ggsave(filename = file.path(outdir, paste0("orig_site_", pid, ".png")),
+         plot     = grid,
+         width    = 14, height = 8, dpi = 300)
+}
